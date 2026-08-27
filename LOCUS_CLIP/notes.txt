@@ -1,0 +1,6 @@
+problems that i run into 
+1. The fonts i install from the browser do not show up in the dropdown options for the fonts.
+2. There is only one option for fonts i.e Bold. There should be Light, Extralight, SemiBold, Medium/regular etc.
+3. Options for adding a stroke to the text. Shadows on the text. In the form of a slider which will determine how strong the effect is. 
+4. Adding an option to clipping a whole video into sections of 1 minute shorts. 
+    example: Cutting a 24 minute video into 1 minute shorts.

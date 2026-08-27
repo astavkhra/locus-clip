@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(.venv/Scripts/pip.exe *)",
+      "Bash(pip *)",
+      "Bash(pip3 *)",
+      "Bash(ffmpeg *)",
+      "Bash(ffprobe *)",
+      "Bash(ls *)",
+      "Bash(ls)",
+      "Bash(cat *)",
+      "Bash(echo *)",
+      "Bash(find *)",
+      "Bash(where.exe *)",
+      "Bash(grep *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+
+      "PowerShell(ffmpeg *)",
+      "PowerShell(ffprobe *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-Content *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Select-Object *)",
+      "PowerShell(d:\\FCP\\clipping\\.venv\\Scripts\\python.exe *)",
+      "PowerShell(d:\\FCP\\clipping\\.venv\\Scripts\\pip.exe *)",
+      "PowerShell(d:\\FCP\\clipping\\.venv\\Scripts\\pythonw.exe *)"
+    ],
+    "ask": [
+      "Bash(rm *)",
+      "Bash(rmdir *)",
+      "Bash(del *)",
+      "PowerShell(Remove-Item *)",
+      "PowerShell(rm *)",
+      "PowerShell(del *)",
+      "PowerShell(rmdir *)",
+      "PowerShell(Clear-Content *)"
+    ]
+  }
+}

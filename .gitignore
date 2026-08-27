@@ -1,0 +1,29 @@
+# --- Virtual environment (lives at repo root; not committed) ---
+.venv/
+
+# --- Stray project accidentally dropped into this folder ---
+supoclip/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Secrets ---
+.env
+LOCUS_CLIP/.env
+
+# --- Personal Claude Code settings (project settings.json IS committed) ---
+.claude/settings.local.json
+
+# --- Media & generated output (keep the folders, ignore their contents) ---
+LOCUS_CLIP/input_videos/*
+LOCUS_CLIP/output_video/*
+!LOCUS_CLIP/input_videos/.gitkeep
+!LOCUS_CLIP/output_video/.gitkeep
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.avi
+*.ass
