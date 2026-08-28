@@ -36,11 +36,18 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(ROOT, "output_video")
 CACHE_DIR = os.path.join(ROOT, ".cache")
 
-# Reuse the subtitle tool's transcription + caption + styling code.
+# Reuse the subtitle tool's transcription + caption + styling code, and the
+# trimmer's silence detection.
 sys.path.insert(0, os.path.join(ROOT, "subtitler"))
+sys.path.insert(0, os.path.join(ROOT, "trimmer"))
 import subtitle as st  # noqa: E402  (transcribe, build_captions, build_ass, THEMES, FFMPEG...)
+import trim as tr      # noqa: E402  (detect_silences, compute_keeps)
 
 GEMINI_MODEL = "gemini-3.6-flash"
+
+# Silence-trim tuning (mirrors trim.py's defaults) for --tighten.
+SIL_PADDING = 0.08      # keep this much audio around each kept segment (s)
+SIL_MIN_SEGMENT = 0.05  # drop kept segments shorter than this (s)
 
 
 # --- default options for the reused subtitle.py functions -------------------
@@ -211,26 +218,88 @@ def _clip_captions(captions, start, end):
     return out
 
 
-def _reframe_chain(mode, ass_name, fontsdir):
-    """filter_complex producing [v]: reframe (crop|blur|none) then burn subs."""
+def _reframe_chain(mode, ass_name, fontsdir, src="0:v"):
+    """filter fragment producing [v]: reframe (crop|blur|none) then burn subs,
+    reading from pad `src` (0:v for a plain clip, or the concat output vc)."""
     subs = f"subtitles={ass_name}:fontsdir='{fontsdir}'"
     if mode == "crop":
-        return f"[0:v]crop=ih*9/16:ih,scale=1080:1920,setsar=1,{subs}[v]"
+        return f"[{src}]crop=ih*9/16:ih,scale=1080:1920,setsar=1,{subs}[v]"
     if mode == "blur":
         return (
-            "[0:v]split=2[bg][fg];"
+            f"[{src}]split=2[bg][fg];"
             "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
             "crop=1080:1920,gblur=sigma=20[bgb];"
             "[fg]scale=1080:-2:force_original_aspect_ratio=decrease[fgs];"
             f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,{subs}[v]"
         )
-    return f"[0:v]{subs}[v]"   # none: keep source frame, just burn subs
+    return f"[{src}]{subs}[v]"   # none: keep source frame, just burn subs
 
 
-def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True):
-    caps = _clip_captions(captions, clip["start"], clip["end"])
+# --- silence tightening (jump-cut) -----------------------------------------
+def keeps_for_clip(all_silences, start, end):
+    """Loud sub-segments to keep within source window [start,end], returned in
+    CLIP-RELATIVE time (0..dur). Reuses trim.py's compute_keeps (padding+merge)."""
+    dur = end - start
+    rel = []
+    for s, e in all_silences:
+        e = end if e is None else e            # trailing silence runs to clip end
+        s2, e2 = max(s, start), min(e, end)
+        if e2 > s2:
+            rel.append((s2 - start, e2 - start))
+    return tr.compute_keeps(rel, dur, SIL_PADDING, SIL_MIN_SEGMENT)
+
+
+def _make_remap(keeps):
+    """Return f(clip_time) -> tightened_time: total kept content lying before t.
+    Monotonic; a time inside a removed gap maps to the end of the prior keep."""
+    def remap(t):
+        out = 0.0
+        for a, b in keeps:
+            if t >= b:
+                out += b - a
+            elif t <= a:
+                break
+            else:
+                out += t - a
+                break
+        return out
+    return remap
+
+
+def _tighten_captions(captions, start, end, keeps):
+    """Rebase captions to clip-zero, then remap through the kept segments so
+    they stay in sync after the silent gaps are removed."""
+    remap = _make_remap(keeps)
+    out = []
+    for c in captions:
+        if c["end"] <= start or c["start"] >= end:
+            continue
+        ns = remap(max(0.0, c["start"] - start))
+        ne = remap(min(end, c["end"]) - start)
+        if ne - ns < 0.05:                     # fell into a removed gap
+            continue
+        nc = {"start": ns, "end": ne, "text": c["text"]}
+        if c.get("words"):
+            nc["words"] = [
+                {"word": w["word"],
+                 "start": remap(max(0.0, w["start"] - start)),
+                 "end": remap(max(0.0, w["end"] - start))}
+                for w in c["words"]
+            ]
+        out.append(nc)
+    return out
+
+
+def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True, keeps=None):
+    """Render one clip. If `keeps` is given (clip-relative loud segments), the
+    silent gaps are jump-cut out and captions are remapped to match."""
     # 9:16 output -> tell build_ass the canvas is vertical so text isn't stretched.
     opts.aspect = 9 / 16 if reframe in ("crop", "blur") else opts.aspect
+
+    if keeps is not None:
+        caps = _tighten_captions(captions, clip["start"], clip["end"], keeps)
+    else:
+        caps = _clip_captions(captions, clip["start"], clip["end"])
 
     ass_dir = os.path.dirname(os.path.abspath(out_path))
     os.makedirs(ass_dir, exist_ok=True)
@@ -245,12 +314,39 @@ def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True):
     else:
         venc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
 
+    # Build the filtergraph. Without tightening: reframe straight off the clip.
+    # With tightening: trim+concat the kept segments, then reframe the result.
+    script_path = None
+    if keeps is not None:
+        parts = []
+        for i, (a, b) in enumerate(keeps):
+            parts.append(f"[0:v]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{i}];")
+            parts.append(f"[0:a]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[a{i}];")
+        concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(keeps)))
+        parts.append(f"{concat_in}concat=n={len(keeps)}:v=1:a=1[vc][ac];")
+        parts.append(_reframe_chain(reframe, ass_name, fontsdir, src="vc"))
+        graph = "\n".join(parts)
+        audio_map = "[ac]"
+    else:
+        graph = _reframe_chain(reframe, ass_name, fontsdir)
+        audio_map = "0:a?"
+
+    # A long tighten graph can blow the Windows command-line limit, so pass it
+    # via a script file (same trick trim.py uses).
+    if keeps is not None:
+        sfd, script_path = tempfile.mkstemp(suffix=".txt", dir=ass_dir, text=True)
+        with os.fdopen(sfd, "w", encoding="utf-8") as f:
+            f.write(graph)
+        filter_args = ["-filter_complex_script", os.path.basename(script_path)]
+    else:
+        filter_args = ["-filter_complex", graph]
+
     cmd = [
         st.FFMPEG, "-y",
         "-ss", f"{clip['start']:.3f}", "-i", os.path.abspath(video),
         "-t", f"{clip['dur']:.3f}",
-        "-filter_complex", _reframe_chain(reframe, ass_name, fontsdir),
-        "-map", "[v]", "-map", "0:a?",
+        *filter_args,
+        "-map", "[v]", "-map", audio_map,
         *venc, "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k",
         os.path.abspath(out_path),
@@ -258,8 +354,9 @@ def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True):
     try:
         subprocess.run(cmd, cwd=ass_dir, check=True, capture_output=True, text=True)
     finally:
-        if os.path.exists(ass_path):
-            os.remove(ass_path)
+        for p in (ass_path, script_path):
+            if p and os.path.exists(p):
+                os.remove(p)
 
 
 def nvenc_available():
@@ -292,6 +389,12 @@ def main():
     p.add_argument("--theme", default="classic", choices=sorted(st.THEMES))
     p.add_argument("--style", default="words", choices=["words", "karaoke", "segments"])
     p.add_argument("--font", default="Arial")
+    p.add_argument("--tighten", action="store_true",
+                   help="jump-cut silent gaps out of each clip (captions stay synced)")
+    p.add_argument("--silence-threshold", type=float, default=-35.0,
+                   help="silence level in dB for --tighten (higher = cuts more)")
+    p.add_argument("--min-silence", type=float, default=0.3,
+                   help="only cut silent gaps longer than this for --tighten (s)")
     p.add_argument("--no-cache", action="store_true", help="force re-transcription")
     p.add_argument("--no-nvenc", action="store_true", help="use CPU x264 instead of NVENC")
     p.add_argument("--dry-run", action="store_true", help="select clips but don't render")
@@ -312,9 +415,22 @@ def main():
     if not clips:
         sys.exit("Gemini returned no clips passing the length/score gates.")
 
+    # Optional: detect silences once on the source, then compute per-clip keeps.
+    if args.tighten:
+        print("Detecting silence for --tighten...")
+        all_sil = tr.detect_silences(args.input, args.silence_threshold, args.min_silence)
+        for c in clips:
+            c["keeps"] = keeps_for_clip(all_sil, c["start"], c["end"])
+            c["tight_dur"] = sum(b - a for a, b in c["keeps"])
+
     print(f"\n=== {len(clips)} clip(s) selected ===")
     for i, c in enumerate(clips, 1):
-        print(f"{i:2d}. [{_fmt(c['start'])}-{_fmt(c['end'])}] {c['dur']:4.0f}s "
+        if args.tighten:
+            saved = c["dur"] - c["tight_dur"]
+            dur_str = f"{c['dur']:4.0f}s -> {c['tight_dur']:4.0f}s (-{saved:.0f}s)"
+        else:
+            dur_str = f"{c['dur']:4.0f}s"
+        print(f"{i:2d}. [{_fmt(c['start'])}-{_fmt(c['end'])}] {dur_str} "
               f"score={c['score']}  {c['title']}")
         print(f"      {c['reason']}")
 
@@ -334,13 +450,15 @@ def main():
     if not args.no_nvenc and not use_nvenc:
         print("  (NVENC unavailable -- likely an out-of-date GPU driver; using CPU x264)")
 
-    print(f"\nRendering to {out_dir} ({'NVENC' if use_nvenc else 'x264'}, reframe={args.reframe})...")
+    tstr = ", tighten" if args.tighten else ""
+    print(f"\nRendering to {out_dir} ({'NVENC' if use_nvenc else 'x264'}, reframe={args.reframe}{tstr})...")
     for i, c in enumerate(clips, 1):
         out_path = os.path.join(out_dir, f"clip{i:02d}_{_safe(c['title'])}.mp4")
         print(f"  [{i}/{len(clips)}] {_fmt(c['start'])}-{_fmt(c['end'])} -> {os.path.basename(out_path)}")
         try:
             render_clip(args.input, c, captions, opts, out_path,
-                        args.reframe, use_nvenc=use_nvenc)
+                        args.reframe, use_nvenc=use_nvenc,
+                        keeps=c.get("keeps") if args.tighten else None)
         except subprocess.CalledProcessError as e:
             print(f"      FFMPEG FAILED:\n{(e.stderr or '')[-800:]}")
     print(f"\nDone -> {out_dir}")
