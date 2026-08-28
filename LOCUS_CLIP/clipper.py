@@ -129,7 +129,7 @@ Rules:
 - start_line and end_line are transcript INDICES. Never invent timestamps."""
 
 
-def select_clips(raw, opts, max_clips, min_score, min_len, max_len):
+def select_clips(raw, opts, max_clips, min_score, min_len, max_len, focus=None):
     from google import genai
     from google.genai import types
     from pydantic import BaseModel
@@ -159,13 +159,20 @@ def select_clips(raw, opts, max_clips, min_score, min_len, max_len):
         f"Select up to {max_clips} clips."
     )
 
+    system = SYSTEM_INSTRUCTION
+    if focus:
+        # Layer the user's angle on top of the structural rules, which still hold.
+        system += (f"\n\nADDITIONAL FOCUS -- prioritize clips matching this intent, "
+                   f"and score them by how well they fit it: {focus}")
+
     client = genai.Client(api_key=key)
-    print(f"Asking {GEMINI_MODEL} to pick clips from {len(raw)} segments...")
+    print(f"Asking {GEMINI_MODEL} to pick clips from {len(raw)} segments"
+          + (f" (focus: {focus})" if focus else "") + "...")
     resp = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=system,
             response_mime_type="application/json",
             response_schema=ClipSet,
             temperature=0.4,
@@ -389,6 +396,9 @@ def main():
     p.add_argument("--theme", default="classic", choices=sorted(st.THEMES))
     p.add_argument("--style", default="words", choices=["words", "karaoke", "segments"])
     p.add_argument("--font", default="Arial")
+    p.add_argument("--focus", default=None,
+                   help="steer selection toward an angle/audience, e.g. "
+                        "\"controversial takes for crypto skeptics\"")
     p.add_argument("--tighten", action="store_true",
                    help="jump-cut silent gaps out of each clip (captions stay synced)")
     p.add_argument("--silence-threshold", type=float, default=-35.0,
@@ -411,7 +421,8 @@ def main():
         sys.exit("No speech transcribed; nothing to clip.")
 
     # 2. Select clips (Gemini -> reconciled timestamps).
-    clips = select_clips(raw, opts, args.clips, args.min_score, args.min_len, args.max_len)
+    clips = select_clips(raw, opts, args.clips, args.min_score, args.min_len, args.max_len,
+                         focus=args.focus)
     if not clips:
         sys.exit("Gemini returned no clips passing the length/score gates.")
 
