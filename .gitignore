@@ -9,6 +9,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# --- Transcript cache (regenerated on demand) ---
+LOCUS_CLIP/.cache/
+
 # --- Secrets ---
 .env
 LOCUS_CLIP/.env
