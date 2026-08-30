@@ -352,8 +352,9 @@ def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True,
             cw, ch, x0 = plan["crop_w"], plan["crop_h"], plan["commands"][0][1]
             graph = (f"[0:v]sendcmd=f='{os.path.basename(cmd_path)}',"
                      f"crop={cw}:{ch}:{x0}:0,scale=1080:1920,setsar=1,{subs}[v]")
-            print(f"      tracked: face in {plan['n_hits']}/{plan['n_samples']} "
-                  f"sampled frames, {plan['n_cuts']} scene-cut(s)")
+            held = plan["n_samples"] - plan["n_face"] - plan["n_sal"]
+            print(f"      tracked {plan['n_samples']} frames: face {plan['n_face']}, "
+                  f"saliency {plan['n_sal']}, held {held}; {plan['n_cuts']} scene-cut(s)")
         audio_map = "0:a?"
     else:
         graph = _reframe_chain(reframe, ass_name, fontsdir)

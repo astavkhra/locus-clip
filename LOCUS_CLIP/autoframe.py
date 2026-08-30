@@ -32,14 +32,49 @@ def ensure_model(path):
     return path
 
 
+def _make_saliency():
+    """Static spectral-residual saliency detector, or None if unavailable."""
+    if not hasattr(cv2, "saliency"):
+        return None
+    try:
+        return cv2.saliency.StaticSaliencySpectralResidual_create()
+    except Exception:
+        return None
+
+
+def _saliency_center_x(sal, frame, w):
+    """Horizontal center-of-mass of visual saliency (peaks emphasized), or None.
+    Used only when no face is present, so volatile shots follow the focal point
+    instead of freezing on a stale position."""
+    if sal is None:
+        return None
+    try:
+        ok, smap = sal.computeSaliency(frame)
+    except Exception:
+        return None
+    if not ok or smap is None:
+        return None
+    smap = smap.astype(np.float32)
+    smap *= smap                                   # emphasize salient peaks
+    col = smap.sum(axis=0)
+    total = float(col.sum())
+    if total <= 0:
+        return None
+    wm = col.shape[0]
+    cx_map = float((np.arange(wm, dtype=np.float32) * col).sum() / total)
+    return cx_map / wm * w
+
+
 def _face_centers(ffmpeg, video, start, dur, w, h, model_path,
                   sample_fps=8, score_thresh=0.6):
-    """Sample the clip at `sample_fps` and return [(clip_time, center_x|None)].
+    """Sample the clip at `sample_fps` and return [(clip_time, center_x, kind)].
 
-    Frames are piped from ffmpeg (handles odd filenames + only decodes the
-    frames we sample) as raw BGR, then run through YuNet."""
+    kind is 'face' (YuNet, authoritative), 'sal' (saliency fallback when no
+    face), or None (nothing found). Frames are piped from ffmpeg (handles odd
+    filenames + only decodes the frames we sample) as raw BGR."""
     det = cv2.FaceDetectorYN.create(model_path, "", (w, h), score_thresh)
     det.setInputSize((w, h))
+    sal = _make_saliency()
     proc = subprocess.Popen(
         [ffmpeg, "-hide_banner", "-loglevel", "error",
          "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", os.path.abspath(video),
@@ -54,11 +89,13 @@ def _face_centers(ffmpeg, video, start, dur, w, h, model_path,
             break
         frame = np.frombuffer(buf, np.uint8).reshape((h, w, 3)).copy()
         _, faces = det.detect(frame)
-        cx = None
         if faces is not None and len(faces):
-            best = max(faces, key=lambda f: f[2] * f[3])   # most prominent face
-            cx = float(best[0] + best[2] / 2.0)
-        samples.append((i / sample_fps, cx))
+            best = max(faces, key=lambda f: f[2] * f[3])   # most prominent face wins
+            cx, kind = float(best[0] + best[2] / 2.0), "face"
+        else:
+            cx = _saliency_center_x(sal, frame, w)         # fall back to focal point
+            kind = "sal" if cx is not None else None
+        samples.append((i / sample_fps, cx, kind))
         i += 1
     proc.stdout.close()
     proc.wait()
@@ -82,7 +119,7 @@ def build_track(ffmpeg, video, start, dur, w, h, model_path,
     or None if no face is ever found (caller should fall back to a center crop)."""
     model_path = ensure_model(model_path)
     samples = _face_centers(ffmpeg, video, start, dur, w, h, model_path, sample_fps)
-    if not samples or all(cx is None for _, cx in samples):
+    if not samples or all(cx is None for _, cx, _ in samples):
         return None
 
     crop_w = min(w, int(round(h * out_ar)))
@@ -92,9 +129,9 @@ def build_track(ffmpeg, video, start, dur, w, h, model_path,
     deadzone = w * deadzone_frac
     cuts = _scene_cuts(ffmpeg, video, start, dur)
 
-    # Fill undetected frames with the last known center (holds position).
+    # Fill any still-empty frames (no face AND no saliency) with the last center.
     filled, last = [], w / 2.0
-    for t, cx in samples:
+    for t, cx, _ in samples:
         if cx is None:
             cx = last
         else:
@@ -117,9 +154,11 @@ def build_track(ffmpeg, video, start, dur, w, h, model_path,
         commands.append((t, x_left))
         prev_t = t
 
-    n_hits = sum(1 for _, cx in samples if cx is not None)
+    n_face = sum(1 for _, _, k in samples if k == "face")
+    n_sal = sum(1 for _, _, k in samples if k == "sal")
     return {"crop_w": crop_w, "crop_h": crop_h, "commands": commands,
-            "n_hits": n_hits, "n_samples": len(samples), "n_cuts": len(cuts)}
+            "n_face": n_face, "n_sal": n_sal, "n_samples": len(samples),
+            "n_cuts": len(cuts)}
 
 
 def write_sendcmd(commands, path):
