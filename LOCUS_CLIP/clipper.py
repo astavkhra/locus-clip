@@ -312,10 +312,33 @@ def _tighten_captions(captions, start, end, keeps):
     return out
 
 
+def _remap_commands(commands, keeps):
+    """Remap crop-x sendcmd times through the kept segments (for track+tighten):
+    the trajectory was measured on the original clip, but after silences are cut
+    the timeline is compressed, so command times must move with it."""
+    remap = _make_remap(keeps)
+    out, last_t = [], -1.0
+    for t_clip, x in commands:
+        t_out = remap(t_clip)
+        if t_out > last_t + 1e-3:        # keep strictly increasing; gaps collapse
+            out.append((t_out, x))
+            last_t = t_out
+    return out
+
+
+def _track_filter(src, cmd_name, cw, ch, x0, ass_name, fontsdir):
+    """sendcmd-driven moving crop off pad `src`, then scale + burn subs -> [v]."""
+    subs = f"subtitles={ass_name}:fontsdir='{fontsdir}'"
+    return (f"[{src}]sendcmd=f='{cmd_name}',crop={cw}:{ch}:{x0}:0,"
+            f"scale=1080:1920,setsar=1,{subs}[v]")
+
+
 def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True,
-                keeps=None, src_w=1920, src_h=1080):
-    """Render one clip. If `keeps` is given (clip-relative loud segments), the
-    silent gaps are jump-cut out and captions are remapped to match."""
+                keeps=None, src_w=1920, src_h=1080, multi_speaker=False):
+    """Render one clip in a single pass. Any combination of:
+      - keeps  -> jump-cut silences (captions + track trajectory remapped to match)
+      - reframe track -> face/speaker-following 9:16 crop
+    is supported."""
     # 9:16 output -> tell build_ass the canvas is vertical so text isn't stretched.
     opts.aspect = 9 / 16 if reframe in ("crop", "blur") else opts.aspect
 
@@ -337,8 +360,8 @@ def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True,
     else:
         venc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
 
-    # Build the filtergraph. Without tightening: reframe straight off the clip.
-    # With tightening: trim+concat the kept segments, then reframe the result.
+    # Build the filtergraph in two stages: (1) a base video pad -- optionally the
+    # trim+concat of the loud segments when tightening -- then (2) the reframe.
     script_path = cmd_path = None
     if keeps is not None:
         parts = []
@@ -347,34 +370,38 @@ def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True,
             parts.append(f"[0:a]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[a{i}];")
         concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(keeps)))
         parts.append(f"{concat_in}concat=n={len(keeps)}:v=1:a=1[vc][ac];")
-        parts.append(_reframe_chain(reframe, ass_name, fontsdir, src="vc"))
-        graph = "\n".join(parts)
-        audio_map = "[ac]"
-    elif reframe == "track":
-        # Face-follow: plan a moving crop, then drive it with a sendcmd script.
+        prefix, base, audio_map = "\n".join(parts) + "\n", "vc", "[ac]"
+    else:
+        prefix, base, audio_map = "", "0:v", "0:a?"
+
+    if reframe == "track":
         plan = autoframe.build_track(st.FFMPEG, video, clip["start"], clip["dur"],
-                                     src_w, src_h, YUNET_MODEL)
-        subs = f"subtitles={ass_name}:fontsdir='{fontsdir}'"
+                                     src_w, src_h, YUNET_MODEL, multi_speaker=multi_speaker)
         if plan is None:
             print("      (no face detected; falling back to center crop)")
-            graph = _reframe_chain("crop", ass_name, fontsdir)
+            reframe_graph = _reframe_chain("crop", ass_name, fontsdir, src=base)
         else:
+            cmds = plan["commands"]
+            if keeps is not None:                       # remap trajectory to tightened time
+                cmds = _remap_commands(cmds, keeps)
             cfd, cmd_path = tempfile.mkstemp(suffix=".cmd", dir=ass_dir, text=True)
             os.close(cfd)
-            autoframe.write_sendcmd(plan["commands"], cmd_path)
-            cw, ch, x0 = plan["crop_w"], plan["crop_h"], plan["commands"][0][1]
-            graph = (f"[0:v]sendcmd=f='{os.path.basename(cmd_path)}',"
-                     f"crop={cw}:{ch}:{x0}:0,scale=1080:1920,setsar=1,{subs}[v]")
+            autoframe.write_sendcmd(cmds, cmd_path)
+            reframe_graph = _track_filter(base, os.path.basename(cmd_path),
+                                          plan["crop_w"], plan["crop_h"], cmds[0][1],
+                                          ass_name, fontsdir)
             held = plan["n_samples"] - plan["n_face"] - plan["n_sal"]
+            extra = f", {plan['n_switch']} speaker-switch(es)" if multi_speaker else ""
             print(f"      tracked {plan['n_samples']} frames: face {plan['n_face']}, "
-                  f"saliency {plan['n_sal']}, held {held}; {plan['n_cuts']} scene-cut(s)")
-        audio_map = "0:a?"
+                  f"saliency {plan['n_sal']}, held {held}; "
+                  f"{plan['n_cuts']} scene-cut(s){extra}")
     else:
-        graph = _reframe_chain(reframe, ass_name, fontsdir)
-        audio_map = "0:a?"
+        reframe_graph = _reframe_chain(reframe, ass_name, fontsdir, src=base)
 
-    # A long tighten graph can blow the Windows command-line limit, so pass it
-    # via a script file (same trick trim.py uses).
+    graph = prefix + reframe_graph
+
+    # A long graph (tighten's trim+concat) can blow the Windows command-line
+    # limit, so pass it via a script file (same trick trim.py uses).
     if keeps is not None:
         sfd, script_path = tempfile.mkstemp(suffix=".txt", dir=ass_dir, text=True)
         with os.fdopen(sfd, "w", encoding="utf-8") as f:
@@ -430,6 +457,9 @@ def main():
                         "moments instead of self-limiting (still won't include junk)")
     p.add_argument("--reframe", choices=["blur", "crop", "none", "track"], default="blur",
                    help="'track' follows the speaker's face with a moving 9:16 crop")
+    p.add_argument("--multi-speaker", action="store_true",
+                   help="with --reframe track: switch the crop to whoever is speaking "
+                        "(active-speaker by mouth motion) instead of the largest face")
     p.add_argument("--min-score", type=int, default=7, help="drop clips below this score (1-10)")
     p.add_argument("--min-len", type=float, default=12.0, help="drop clips shorter than this (s)")
     p.add_argument("--max-len", type=float, default=75.0, help="drop clips longer than this (s)")
@@ -456,11 +486,8 @@ def main():
 
     if not os.path.isfile(args.input):
         p.error(f"file not found: {args.input}")
-
-    # v1: face-tracking doesn't yet support the tightened (non-linear) timeline.
-    if args.reframe == "track" and args.tighten:
-        print("  (note: --tighten isn't supported with --reframe track yet; ignoring --tighten)")
-        args.tighten = False
+    if args.multi_speaker and args.reframe != "track":
+        print("  (note: --multi-speaker only applies with --reframe track; ignoring)")
 
     opts = default_opts(theme=args.theme, style=args.style, font=args.font,
                         font_size=args.font_size, margin_v=args.margin_v)
@@ -528,7 +555,7 @@ def main():
             render_clip(args.input, c, captions, opts, out_path,
                         args.reframe, use_nvenc=use_nvenc,
                         keeps=c.get("keeps") if args.tighten else None,
-                        src_w=src_w, src_h=src_h)
+                        src_w=src_w, src_h=src_h, multi_speaker=args.multi_speaker)
         except subprocess.CalledProcessError as e:
             print(f"      FFMPEG FAILED:\n{(e.stderr or '')[-800:]}")
     print(f"\nDone -> {out_dir}")
