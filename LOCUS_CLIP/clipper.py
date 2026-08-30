@@ -131,7 +131,7 @@ Rules:
 - start_line and end_line are transcript INDICES. Never invent timestamps."""
 
 
-def select_clips(raw, opts, max_clips, min_score, min_len, max_len, focus=None):
+def select_clips(raw, opts, max_clips, min_score, min_len, max_len, focus=None, target=None):
     from google import genai
     from google.genai import types
     from pydantic import BaseModel
@@ -156,12 +156,25 @@ def select_clips(raw, opts, max_clips, min_score, min_len, max_len, focus=None):
         f"[{i}] ({_fmt(s['start'])}-{_fmt(s['end'])}) {s['text']}"
         for i, s in enumerate(raw)
     )
-    prompt = (
-        f"Transcript ({len(raw)} lines):\n{transcript}\n\n"
-        f"Select up to {max_clips} clips."
-    )
+    if target:
+        instruction = (
+            f"Find the {target} STRONGEST standalone clips. Be thorough: scan the whole "
+            f"transcript -- long videos usually hold more clip-worthy moments than a quick "
+            f"pass finds (key explanations, vivid examples, bold claims, stories, recaps). "
+            f"Aim to return {target}; return fewer ONLY if the material genuinely can't "
+            f"support {target} without including weak clips."
+        )
+    else:
+        instruction = f"Select up to {max_clips} clips."
+    prompt = f"Transcript ({len(raw)} lines):\n{transcript}\n\n{instruction}"
 
     system = SYSTEM_INSTRUCTION
+    if target:
+        # Override the "do not pad" lean: the user explicitly wants ~N clips.
+        system += (f"\n\nThe user wants about {target} clips. This overrides the "
+                   f"'do not pad to a count' rule -- work harder to surface {target} "
+                   f"genuinely worthwhile moments -- but NEVER include a clip that isn't "
+                   f"self-contained and worth watching.")
     if focus:
         # Layer the user's angle on top of the structural rules, which still hold.
         system += (f"\n\nADDITIONAL FOCUS -- prioritize clips matching this intent, "
@@ -410,7 +423,11 @@ def _safe(name):
 def main():
     p = argparse.ArgumentParser(description="Auto-cut a long video into vertical shorts.")
     p.add_argument("input", help="input video file")
-    p.add_argument("--clips", type=int, default=10, help="max clips to produce")
+    p.add_argument("--clips", type=int, default=10,
+                   help="max clips (a cap; Gemini won't pad to reach it)")
+    p.add_argument("--target", type=int, default=None,
+                   help="aim for this many clips: Gemini digs harder for N worthwhile "
+                        "moments instead of self-limiting (still won't include junk)")
     p.add_argument("--reframe", choices=["blur", "crop", "none", "track"], default="blur",
                    help="'track' follows the speaker's face with a moving 9:16 crop")
     p.add_argument("--min-score", type=int, default=7, help="drop clips below this score (1-10)")
@@ -453,11 +470,17 @@ def main():
     if not raw:
         sys.exit("No speech transcribed; nothing to clip.")
 
-    # 2. Select clips (Gemini -> reconciled timestamps).
-    clips = select_clips(raw, opts, args.clips, args.min_score, args.min_len, args.max_len,
-                         focus=args.focus)
+    # 2. Select clips (Gemini -> reconciled timestamps). --target raises the cap
+    #    and tells Gemini to aim for that many worthwhile clips.
+    count = max(args.clips, args.target) if args.target else args.clips
+    clips = select_clips(raw, opts, count, args.min_score, args.min_len, args.max_len,
+                         focus=args.focus, target=args.target)
     if not clips:
         sys.exit("Gemini returned no clips passing the length/score gates.")
+    if args.target and len(clips) < args.target:
+        print(f"  (found {len(clips)} of {args.target} requested; the material didn't "
+              f"support more, or the score/length gates trimmed some -- try a lower "
+              f"--min-score to surface more)")
 
     # Optional: detect silences once on the source, then compute per-clip keeps.
     if args.tighten:
