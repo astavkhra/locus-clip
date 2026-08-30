@@ -42,8 +42,10 @@ sys.path.insert(0, os.path.join(ROOT, "subtitler"))
 sys.path.insert(0, os.path.join(ROOT, "trimmer"))
 import subtitle as st  # noqa: E402  (transcribe, build_captions, build_ass, THEMES, FFMPEG...)
 import trim as tr      # noqa: E402  (detect_silences, compute_keeps)
+import autoframe       # noqa: E402  (build_track, write_sendcmd -- face-tracking reframe)
 
 GEMINI_MODEL = "gemini-3.6-flash"
+YUNET_MODEL = os.path.join(ROOT, "models", "face_detection_yunet.onnx")
 
 # Silence-trim tuning (mirrors trim.py's defaults) for --tighten.
 SIL_PADDING = 0.08      # keep this much audio around each kept segment (s)
@@ -297,7 +299,8 @@ def _tighten_captions(captions, start, end, keeps):
     return out
 
 
-def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True, keeps=None):
+def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True,
+                keeps=None, src_w=1920, src_h=1080):
     """Render one clip. If `keeps` is given (clip-relative loud segments), the
     silent gaps are jump-cut out and captions are remapped to match."""
     # 9:16 output -> tell build_ass the canvas is vertical so text isn't stretched.
@@ -323,7 +326,7 @@ def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True, 
 
     # Build the filtergraph. Without tightening: reframe straight off the clip.
     # With tightening: trim+concat the kept segments, then reframe the result.
-    script_path = None
+    script_path = cmd_path = None
     if keeps is not None:
         parts = []
         for i, (a, b) in enumerate(keeps):
@@ -334,6 +337,24 @@ def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True, 
         parts.append(_reframe_chain(reframe, ass_name, fontsdir, src="vc"))
         graph = "\n".join(parts)
         audio_map = "[ac]"
+    elif reframe == "track":
+        # Face-follow: plan a moving crop, then drive it with a sendcmd script.
+        plan = autoframe.build_track(st.FFMPEG, video, clip["start"], clip["dur"],
+                                     src_w, src_h, YUNET_MODEL)
+        subs = f"subtitles={ass_name}:fontsdir='{fontsdir}'"
+        if plan is None:
+            print("      (no face detected; falling back to center crop)")
+            graph = _reframe_chain("crop", ass_name, fontsdir)
+        else:
+            cfd, cmd_path = tempfile.mkstemp(suffix=".cmd", dir=ass_dir, text=True)
+            os.close(cfd)
+            autoframe.write_sendcmd(plan["commands"], cmd_path)
+            cw, ch, x0 = plan["crop_w"], plan["crop_h"], plan["commands"][0][1]
+            graph = (f"[0:v]sendcmd=f='{os.path.basename(cmd_path)}',"
+                     f"crop={cw}:{ch}:{x0}:0,scale=1080:1920,setsar=1,{subs}[v]")
+            print(f"      tracked: face in {plan['n_hits']}/{plan['n_samples']} "
+                  f"sampled frames, {plan['n_cuts']} scene-cut(s)")
+        audio_map = "0:a?"
     else:
         graph = _reframe_chain(reframe, ass_name, fontsdir)
         audio_map = "0:a?"
@@ -361,7 +382,7 @@ def render_clip(video, clip, captions, opts, out_path, reframe, use_nvenc=True, 
     try:
         subprocess.run(cmd, cwd=ass_dir, check=True, capture_output=True, text=True)
     finally:
-        for p in (ass_path, script_path):
+        for p in (ass_path, script_path, cmd_path):
             if p and os.path.exists(p):
                 os.remove(p)
 
@@ -389,7 +410,8 @@ def main():
     p = argparse.ArgumentParser(description="Auto-cut a long video into vertical shorts.")
     p.add_argument("input", help="input video file")
     p.add_argument("--clips", type=int, default=10, help="max clips to produce")
-    p.add_argument("--reframe", choices=["blur", "crop", "none"], default="blur")
+    p.add_argument("--reframe", choices=["blur", "crop", "none", "track"], default="blur",
+                   help="'track' follows the speaker's face with a moving 9:16 crop")
     p.add_argument("--min-score", type=int, default=7, help="drop clips below this score (1-10)")
     p.add_argument("--min-len", type=float, default=12.0, help="drop clips shorter than this (s)")
     p.add_argument("--max-len", type=float, default=75.0, help="drop clips longer than this (s)")
@@ -416,6 +438,11 @@ def main():
 
     if not os.path.isfile(args.input):
         p.error(f"file not found: {args.input}")
+
+    # v1: face-tracking doesn't yet support the tightened (non-linear) timeline.
+    if args.reframe == "track" and args.tighten:
+        print("  (note: --tighten isn't supported with --reframe track yet; ignoring --tighten)")
+        args.tighten = False
 
     opts = default_opts(theme=args.theme, style=args.style, font=args.font,
                         font_size=args.font_size, margin_v=args.margin_v)
@@ -466,6 +493,8 @@ def main():
     if not args.no_nvenc and not use_nvenc:
         print("  (NVENC unavailable -- likely an out-of-date GPU driver; using CPU x264)")
 
+    src_w, src_h = st.probe_video_size(args.input)   # needed for track-crop math
+
     tstr = ", tighten" if args.tighten else ""
     print(f"\nRendering to {out_dir} ({'NVENC' if use_nvenc else 'x264'}, reframe={args.reframe}{tstr})...")
     for i, c in enumerate(clips, 1):
@@ -474,7 +503,8 @@ def main():
         try:
             render_clip(args.input, c, captions, opts, out_path,
                         args.reframe, use_nvenc=use_nvenc,
-                        keeps=c.get("keeps") if args.tighten else None)
+                        keeps=c.get("keeps") if args.tighten else None,
+                        src_w=src_w, src_h=src_h)
         except subprocess.CalledProcessError as e:
             print(f"      FFMPEG FAILED:\n{(e.stderr or '')[-800:]}")
     print(f"\nDone -> {out_dir}")

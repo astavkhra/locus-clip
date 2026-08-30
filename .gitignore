@@ -12,6 +12,9 @@ __pycache__/
 # --- Transcript cache (regenerated on demand) ---
 LOCUS_CLIP/.cache/
 
+# --- Downloaded models (fetched on first use) ---
+LOCUS_CLIP/models/
+
 # --- Secrets ---
 .env
 LOCUS_CLIP/.env
