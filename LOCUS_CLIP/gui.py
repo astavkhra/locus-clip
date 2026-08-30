@@ -1,11 +1,12 @@
 """
 Clipping Studio -- a small GUI front-end for the workspace.
 
-Pick a video, (optionally) keep a section and strip its silences, then burn
-styled captions -- all in one click. It drives the existing command-line tools
-(trimmer/trim.py and subtitler/subtitle.py) as subprocesses.
+Two tabs:
+  - Auto-Clip: drives clipper.py (AI picks clips, reframe, tighten, captions)
+  - Manual: pick a video, keep a section / strip silences, then burn captions
+    (drives trimmer/trim.py and subtitler/subtitle.py)
 
-Run it with the project venv:  run_gui.bat   (or  .venv\\Scripts\\pythonw gui.py)
+Run it with the project venv:  run_gui.bat   (or  ..\\.venv\\Scripts\\pythonw gui.py)
 """
 
 import glob
@@ -21,6 +22,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SUBTITLE_PY = os.path.join(ROOT, "subtitler", "subtitle.py")
 TRIM_PY = os.path.join(ROOT, "trimmer", "trim.py")
+CLIPPER_PY = os.path.join(ROOT, "clipper.py")
 OUTPUT_DIR = os.path.join(ROOT, "output_video")
 
 # Always drive the tools with the project venv's Python (has faster-whisper).
@@ -62,6 +64,42 @@ AGGRO = {
 
 STYLES = ["karaoke", "words", "segments"]
 PLACEMENTS = ["Middle", "Between middle & lower", "Lower", "Custom (px from bottom)"]
+
+# --- Auto-Clip (clipper.py) options -----------------------------------------
+CLIP_REFRAMES = ["blur", "crop", "none", "track"]
+CLIP_STYLES = ["words", "karaoke", "segments"]
+CLIP_THEMES = ["classic", "white-box", "yellow-box", "black-box", "red-box",
+               "blue-box", "green-box", "purple-box", "pink-box", "mint",
+               "neon", "hormozi", "sunset"]
+
+
+def build_clipper_cmd(o):
+    """Assemble the clipper.py command from every exposed option."""
+    cmd = [PYTHON, CLIPPER_PY, o["inp"]]
+    # count: --target digs for N; otherwise --clips is a cap
+    if o["aim"]:
+        cmd += ["--target", str(o["count"])]
+    else:
+        cmd += ["--clips", str(o["count"])]
+    cmd += ["--reframe", o["reframe"]]
+    if o["multi"] and o["reframe"] == "track":
+        cmd += ["--multi-speaker"]
+    if o["tighten"]:
+        cmd += ["--tighten",
+                "--silence-threshold", str(o["sil_threshold"]),
+                "--min-silence", str(o["min_silence"])]
+    if o["focus"]:
+        cmd += ["--focus", o["focus"]]
+    cmd += ["--theme", o["theme"], "--style", o["style"],
+            "--font", o["font"], "--font-size", str(o["size"]),
+            "--margin-v", str(o["margin_v"]),
+            "--min-score", str(o["min_score"]),
+            "--min-len", str(o["min_len"]), "--max-len", str(o["max_len"])]
+    if o["no_cache"]:
+        cmd += ["--no-cache"]
+    if o["no_nvenc"]:
+        cmd += ["--no-nvenc"]
+    return cmd
 
 
 # --- pure helpers (unit-testable, no GUI) -----------------------------------
@@ -144,25 +182,161 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Clipping Studio")
-        root.geometry("640x760")
+        root.geometry("720x900")
         self.q = queue.Queue()
         self.running = False
+        self._last_done = None
+        self.open_target = OUTPUT_DIR
+        self.run_buttons = []
+        self.font_boxes = []
 
+        outer = ttk.Frame(root, padding=10)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        nb = ttk.Notebook(outer)
+        nb.grid(row=0, column=0, sticky="ew")
+        tab_auto = ttk.Frame(nb, padding=8)
+        tab_manual = ttk.Frame(nb, padding=8)
+        nb.add(tab_auto, text="Auto-Clip (AI)")
+        nb.add(tab_manual, text="Manual (trim + caption)")
+        tab_auto.columnconfigure(0, weight=1)
+        tab_manual.columnconfigure(0, weight=1)
+        self._build_auto_tab(tab_auto)
+        self._build_manual_tab(tab_manual)
+
+        # shared status + actions bar
+        bar = ttk.Frame(outer)
+        bar.grid(row=1, column=0, sticky="ew", pady=8)
+        bar.columnconfigure(0, weight=1)
+        self.status = ttk.Label(bar, text="Ready.")
+        self.status.grid(row=0, column=0, sticky="w", padx=8)
+        self.clear_btn = ttk.Button(bar, text="Clear output", command=self.clear_output)
+        self.clear_btn.grid(row=0, column=1, padx=4)
+        self.open_btn = ttk.Button(bar, text="Open output folder", command=self._open_output)
+        self.open_btn.grid(row=0, column=2, padx=4)
+
+        # shared log
+        self.log = scrolledtext.ScrolledText(outer, height=12, wrap="word", state="disabled")
+        self.log.grid(row=2, column=0, sticky="nsew", pady=6)
+
+        # populate fonts in the background so startup stays snappy
+        threading.Thread(target=self._load_fonts, daemon=True).start()
+        self.root.after(100, self._poll)
+
+    # --- Auto-Clip tab ---
+    def _build_auto_tab(self, t):
+        pad = {"padx": 6, "pady": 3}
+
+        f_in = ttk.LabelFrame(t, text="Input video", padding=8)
+        f_in.grid(row=0, column=0, sticky="ew", pady=5)
+        f_in.columnconfigure(0, weight=1)
+        self.a_input_var = tk.StringVar()
+        ttk.Entry(f_in, textvariable=self.a_input_var).grid(row=0, column=0, sticky="ew", **pad)
+        ttk.Button(f_in, text="Browse...",
+                   command=lambda: self._browse(self.a_input_var)).grid(row=0, column=1, **pad)
+
+        f_sel = ttk.LabelFrame(t, text="Clip selection (AI)", padding=8)
+        f_sel.grid(row=1, column=0, sticky="ew", pady=5)
+        f_sel.columnconfigure(3, weight=1)
+        ttk.Label(f_sel, text="How many").grid(row=0, column=0, sticky="w", **pad)
+        self.a_count_var = tk.IntVar(value=8)
+        ttk.Spinbox(f_sel, from_=1, to=50, textvariable=self.a_count_var, width=6).grid(
+            row=0, column=1, sticky="w", **pad)
+        self.a_aim_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f_sel, text="Aim for this many (dig harder)",
+                        variable=self.a_aim_var).grid(row=0, column=2, columnspan=2, sticky="w", **pad)
+        ttk.Label(f_sel, text="Min score").grid(row=1, column=0, sticky="w", **pad)
+        self.a_minscore_var = tk.IntVar(value=7)
+        ttk.Spinbox(f_sel, from_=1, to=10, textvariable=self.a_minscore_var, width=6).grid(
+            row=1, column=1, sticky="w", **pad)
+        ttk.Label(f_sel, text="Length (s)").grid(row=1, column=2, sticky="e", **pad)
+        lenf = ttk.Frame(f_sel)
+        lenf.grid(row=1, column=3, sticky="w", padx=6)
+        self.a_minlen_var = tk.IntVar(value=12)
+        self.a_maxlen_var = tk.IntVar(value=75)
+        ttk.Spinbox(lenf, from_=1, to=120, textvariable=self.a_minlen_var, width=5).pack(side="left")
+        ttk.Label(lenf, text="to").pack(side="left", padx=3)
+        ttk.Spinbox(lenf, from_=5, to=300, textvariable=self.a_maxlen_var, width=5).pack(side="left")
+        ttk.Label(f_sel, text="Focus (optional angle / audience)").grid(
+            row=2, column=0, columnspan=4, sticky="w", **pad)
+        self.a_focus_var = tk.StringVar()
+        ttk.Entry(f_sel, textvariable=self.a_focus_var).grid(
+            row=3, column=0, columnspan=4, sticky="ew", **pad)
+
+        f_rf = ttk.LabelFrame(t, text="Reframe to 9:16", padding=8)
+        f_rf.grid(row=2, column=0, sticky="ew", pady=5)
+        f_rf.columnconfigure(3, weight=1)
+        ttk.Label(f_rf, text="Mode").grid(row=0, column=0, sticky="w", **pad)
+        self.a_reframe_var = tk.StringVar(value="blur")
+        ttk.Combobox(f_rf, textvariable=self.a_reframe_var, values=CLIP_REFRAMES,
+                     state="readonly", width=10).grid(row=0, column=1, sticky="w", **pad)
+        self.a_multi_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f_rf, text="Multi-speaker (track only)",
+                        variable=self.a_multi_var).grid(row=0, column=2, columnspan=2, sticky="w", **pad)
+        self.a_tighten_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f_rf, text="Tighten (cut silences)",
+                        variable=self.a_tighten_var).grid(row=1, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(f_rf, text="Silence dB / gap").grid(row=1, column=2, sticky="e", **pad)
+        silf = ttk.Frame(f_rf)
+        silf.grid(row=1, column=3, sticky="w", padx=6)
+        self.a_silthr_var = tk.IntVar(value=-35)
+        self.a_minsil_var = tk.DoubleVar(value=0.3)
+        ttk.Spinbox(silf, from_=-60, to=-10, textvariable=self.a_silthr_var, width=5).pack(side="left")
+        ttk.Spinbox(silf, from_=0.1, to=2.0, increment=0.1,
+                    textvariable=self.a_minsil_var, width=5).pack(side="left", padx=3)
+
+        f_cap = ttk.LabelFrame(t, text="Captions", padding=8)
+        f_cap.grid(row=3, column=0, sticky="ew", pady=5)
+        ttk.Label(f_cap, text="Style").grid(row=0, column=0, sticky="w", **pad)
+        self.a_style_var = tk.StringVar(value="words")
+        ttk.Combobox(f_cap, textvariable=self.a_style_var, values=CLIP_STYLES,
+                     state="readonly", width=10).grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(f_cap, text="Theme").grid(row=0, column=2, sticky="w", **pad)
+        self.a_theme_var = tk.StringVar(value="classic")
+        ttk.Combobox(f_cap, textvariable=self.a_theme_var, values=CLIP_THEMES,
+                     state="readonly", width=12).grid(row=0, column=3, sticky="w", **pad)
+        ttk.Label(f_cap, text="Font").grid(row=1, column=0, sticky="w", **pad)
+        self.a_font_var = tk.StringVar(value="Arial")
+        a_font_box = ttk.Combobox(f_cap, textvariable=self.a_font_var, values=["Arial"], width=24)
+        a_font_box.grid(row=1, column=1, columnspan=3, sticky="w", **pad)
+        self.font_boxes.append(a_font_box)
+        ttk.Label(f_cap, text="Size").grid(row=2, column=0, sticky="w", **pad)
+        self.a_size_var = tk.IntVar(value=52)
+        ttk.Spinbox(f_cap, from_=10, to=140, textvariable=self.a_size_var, width=6).grid(
+            row=2, column=1, sticky="w", **pad)
+        ttk.Label(f_cap, text="Margin").grid(row=2, column=2, sticky="w", **pad)
+        self.a_margin_var = tk.IntVar(value=150)
+        ttk.Spinbox(f_cap, from_=0, to=600, textvariable=self.a_margin_var, width=6).grid(
+            row=2, column=3, sticky="w", **pad)
+
+        f_adv = ttk.LabelFrame(t, text="Advanced", padding=8)
+        f_adv.grid(row=4, column=0, sticky="ew", pady=5)
+        self.a_nocache_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f_adv, text="Re-transcribe (ignore cache)",
+                        variable=self.a_nocache_var).grid(row=0, column=0, sticky="w", **pad)
+        self.a_nonvenc_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f_adv, text="CPU encode (no NVENC)",
+                        variable=self.a_nonvenc_var).grid(row=0, column=1, sticky="w", **pad)
+
+        btn = ttk.Button(t, text="Auto-Clip", command=self.on_autoclip)
+        btn.grid(row=5, column=0, sticky="w", pady=10, padx=6)
+        self.run_buttons.append(btn)
+
+    # --- Manual tab (trim + caption) ---
+    def _build_manual_tab(self, t):
         pad = {"padx": 8, "pady": 4}
-        main = ttk.Frame(root, padding=12)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
 
-        # --- Input ---
-        f_in = ttk.LabelFrame(main, text="1. Input video", padding=8)
+        f_in = ttk.LabelFrame(t, text="1. Input video", padding=8)
         f_in.grid(row=0, column=0, sticky="ew", pady=6)
         f_in.columnconfigure(0, weight=1)
         self.input_var = tk.StringVar()
         ttk.Entry(f_in, textvariable=self.input_var).grid(row=0, column=0, sticky="ew", **pad)
-        ttk.Button(f_in, text="Browse...", command=self.browse).grid(row=0, column=1, **pad)
+        ttk.Button(f_in, text="Browse...",
+                   command=lambda: self._browse(self.input_var)).grid(row=0, column=1, **pad)
 
-        # --- Trim ---
-        f_trim = ttk.LabelFrame(main, text="2. Keep a section (optional) + remove silences", padding=8)
+        f_trim = ttk.LabelFrame(t, text="2. Keep a section (optional) + remove silences", padding=8)
         f_trim.grid(row=1, column=0, sticky="ew", pady=6)
         ttk.Label(f_trim, text="Start").grid(row=0, column=0, **pad)
         self.start_var = tk.StringVar()
@@ -180,8 +354,7 @@ class App:
         ttk.Combobox(f_trim, textvariable=self.aggro_var, values=list(AGGRO),
                      state="readonly", width=12).grid(row=2, column=3, **pad)
 
-        # --- Captions ---
-        f_cap = ttk.LabelFrame(main, text="3. Caption style", padding=8)
+        f_cap = ttk.LabelFrame(t, text="3. Caption style", padding=8)
         f_cap.grid(row=2, column=0, sticky="ew", pady=6)
         f_cap.columnconfigure(1, weight=1)
         ttk.Label(f_cap, text="Mode").grid(row=0, column=0, sticky="w", **pad)
@@ -190,8 +363,9 @@ class App:
                      state="readonly", width=14).grid(row=0, column=1, sticky="w", **pad)
         ttk.Label(f_cap, text="Font").grid(row=1, column=0, sticky="w", **pad)
         self.font_var = tk.StringVar(value="Satoshi")
-        self.font_box = ttk.Combobox(f_cap, textvariable=self.font_var, values=["Satoshi"], width=28)
-        self.font_box.grid(row=1, column=1, sticky="w", **pad)
+        m_font_box = ttk.Combobox(f_cap, textvariable=self.font_var, values=["Satoshi"], width=28)
+        m_font_box.grid(row=1, column=1, sticky="w", **pad)
+        self.font_boxes.append(m_font_box)
         ttk.Label(f_cap, text="Size").grid(row=2, column=0, sticky="w", **pad)
         self.size_var = tk.IntVar(value=48)
         ttk.Spinbox(f_cap, from_=10, to=120, textvariable=self.size_var, width=6).grid(
@@ -202,8 +376,7 @@ class App:
         ttk.Checkbutton(f_cap, text="Background box", variable=self.box_var).grid(
             row=3, column=1, sticky="w", **pad)
 
-        # --- Placement ---
-        f_pos = ttk.LabelFrame(main, text="4. Placement", padding=8)
+        f_pos = ttk.LabelFrame(t, text="4. Placement", padding=8)
         f_pos.grid(row=3, column=0, sticky="ew", pady=6)
         self.place_var = tk.StringVar(value="Between middle & lower")
         for i, name in enumerate(PLACEMENTS):
@@ -215,27 +388,9 @@ class App:
         ttk.Label(f_pos, text="px from bottom").grid(row=3, column=2, sticky="w")
         self._toggle_custom()
 
-        # --- Run + log ---
-        bar = ttk.Frame(main)
-        bar.grid(row=4, column=0, sticky="ew", pady=8)
-        bar.columnconfigure(1, weight=1)
-        self.run_btn = ttk.Button(bar, text="Generate", command=self.on_generate)
-        self.run_btn.grid(row=0, column=0, padx=4)
-        self.status = ttk.Label(bar, text="Ready.")
-        self.status.grid(row=0, column=1, sticky="w", padx=8)
-        self.clear_btn = ttk.Button(bar, text="Clear output", command=self.clear_output)
-        self.clear_btn.grid(row=0, column=2, padx=4)
-        self.open_btn = ttk.Button(bar, text="Open output folder",
-                                   command=lambda: os.startfile(OUTPUT_DIR))
-        self.open_btn.grid(row=0, column=3, padx=4)
-
-        self.log = scrolledtext.ScrolledText(main, height=12, wrap="word", state="disabled")
-        self.log.grid(row=5, column=0, sticky="nsew", pady=6)
-        main.rowconfigure(5, weight=1)
-
-        # populate fonts in the background so startup stays snappy
-        threading.Thread(target=self._load_fonts, daemon=True).start()
-        self.root.after(100, self._poll)
+        btn = ttk.Button(t, text="Generate", command=self.on_generate)
+        btn.grid(row=4, column=0, sticky="w", pady=10, padx=8)
+        self.run_buttons.append(btn)
 
     # --- small UI callbacks ---
     def _toggle_custom(self):
@@ -246,14 +401,14 @@ class App:
         fonts = list_fonts()
         self.q.put(("fonts", fonts))
 
-    def browse(self):
+    def _browse(self, var):
         path = filedialog.askopenfilename(
             title="Choose a video",
             initialdir=os.path.join(ROOT, "input_videos"),
             filetypes=[("Video", "*.mp4 *.mov *.mkv *.webm *.m4v *.avi"), ("All files", "*.*")],
         )
         if path:
-            self.input_var.set(path)
+            var.set(path)
 
     def _log(self, text):
         self.log.configure(state="normal")
@@ -261,7 +416,70 @@ class App:
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    # --- run pipeline ---
+    def _set_running(self, running):
+        self.running = running
+        state = "disabled" if running else "normal"
+        for b in self.run_buttons:
+            b.configure(state=state)
+        self.clear_btn.configure(state=state)
+
+    def _start(self, status, worker, opts):
+        self._set_running(True)
+        self.status.configure(text=status)
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        threading.Thread(target=worker, args=(opts,), daemon=True).start()
+
+    def _open_output(self):
+        target = self.open_target if os.path.isdir(self.open_target) else OUTPUT_DIR
+        if os.path.isdir(target):
+            os.startfile(target)
+
+    # --- Auto-Clip run ---
+    def on_autoclip(self):
+        if self.running:
+            return
+        inp = self.a_input_var.get().strip().strip('"')
+        if not inp or not os.path.isfile(inp):
+            messagebox.showerror("Clipping Studio", "Please choose a valid input video.")
+            return
+        opts = dict(
+            inp=inp,
+            count=int(self.a_count_var.get()),
+            aim=self.a_aim_var.get(),
+            min_score=int(self.a_minscore_var.get()),
+            min_len=int(self.a_minlen_var.get()),
+            max_len=int(self.a_maxlen_var.get()),
+            focus=self.a_focus_var.get().strip(),
+            reframe=self.a_reframe_var.get(),
+            multi=self.a_multi_var.get(),
+            tighten=self.a_tighten_var.get(),
+            sil_threshold=int(self.a_silthr_var.get()),
+            min_silence=round(float(self.a_minsil_var.get()), 2),
+            style=self.a_style_var.get(),
+            theme=self.a_theme_var.get(),
+            font=self.a_font_var.get().strip() or "Arial",
+            size=int(self.a_size_var.get()),
+            margin_v=int(self.a_margin_var.get()),
+            no_cache=self.a_nocache_var.get(),
+            no_nvenc=self.a_nonvenc_var.get(),
+        )
+        self.open_target = OUTPUT_DIR
+        self._start("Auto-clipping (transcribe + select + render)...", self._worker_autoclip, opts)
+
+    def _worker_autoclip(self, o):
+        try:
+            self._last_done = None
+            code = self._run_step("Auto-Clip", build_clipper_cmd(o))
+            if code != 0:
+                self.q.put(("error", "Auto-clip failed (see log)."))
+                return
+            self.q.put(("done_dir", self._last_done or OUTPUT_DIR))
+        except Exception as e:  # noqa: BLE001 - surface anything to the log
+            self.q.put(("error", f"{type(e).__name__}: {e}"))
+
+    # --- Manual run ---
     def on_generate(self):
         if self.running:
             return
@@ -290,14 +508,8 @@ class App:
             placement=self.place_var.get(),
             custom_px=self.custom_px_var.get(),
         )
-        self.running = True
-        self.run_btn.configure(state="disabled")
-        self.clear_btn.configure(state="disabled")
-        self.status.configure(text="Working...")
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
-        threading.Thread(target=self._worker, args=(opts,), daemon=True).start()
+        self.open_target = OUTPUT_DIR
+        self._start("Working...", self._worker, opts)
 
     def _run_step(self, label, cmd):
         self.q.put(("log", f"\n=== {label} ===\n$ " + subprocess.list2cmdline(cmd)))
@@ -305,7 +517,10 @@ class App:
                                 encoding="utf-8", errors="replace", bufsize=1,
                                 creationflags=_NO_WINDOW)
         for line in proc.stdout:
-            self.q.put(("log", line.rstrip()))
+            line = line.rstrip()
+            self.q.put(("log", line))
+            if "Done ->" in line:                       # clipper prints its output dir
+                self._last_done = line.split("Done ->", 1)[1].strip()
         proc.wait()
         return proc.returncode
 
@@ -351,23 +566,25 @@ class App:
                 elif kind == "status":
                     self.status.configure(text=payload)
                 elif kind == "fonts":
-                    self.font_box.configure(values=payload)
+                    for box in self.font_boxes:
+                        box.configure(values=payload)
                 elif kind == "error":
                     self._finish(f"Error: {payload}")
                     messagebox.showerror("Clipping Studio", payload)
                 elif kind == "done":
                     self._log(f"\nDone -> {payload}")
                     self._finish("Done.")
-                    self.open_btn.configure(state="normal")
                     messagebox.showinfo("Clipping Studio", f"Finished!\n\n{payload}")
+                elif kind == "done_dir":
+                    self.open_target = payload
+                    self._finish("Done.")
+                    messagebox.showinfo("Clipping Studio", f"Clips ready!\n\n{payload}")
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
 
     def _finish(self, status):
-        self.running = False
-        self.run_btn.configure(state="normal")
-        self.clear_btn.configure(state="normal")
+        self._set_running(False)
         self.status.configure(text=status)
 
     def clear_output(self):
