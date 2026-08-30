@@ -51,7 +51,7 @@ SIL_MIN_SEGMENT = 0.05  # drop kept segments shorter than this (s)
 
 
 # --- default options for the reused subtitle.py functions -------------------
-def default_opts(theme="classic", style="words", font="Arial", font_size=52):
+def default_opts(theme="classic", style="words", font="Arial", font_size=52, margin_v=150):
     """Build an argparse-style namespace with subtitle.py's defaults.
 
     Font size is bumped from subtitle.py's 24 because captions sit on a tall
@@ -68,7 +68,7 @@ def default_opts(theme="classic", style="words", font="Arial", font_size=52):
         # styling
         theme=theme, font=font, font_size=font_size, bold=True,
         color=None, outline_color=None, highlight_color=None, box=None,
-        outline=0.0, shadow=0.6, position="bottom", margin_v=150, max_chars=28,
+        outline=0.0, shadow=0.6, position="bottom", margin_v=margin_v, max_chars=28,
         # encode (only used by subtitle.py's burn(); we render ourselves)
         preset="medium", crf=18,
         aspect=9 / 16,
@@ -396,6 +396,10 @@ def main():
     p.add_argument("--theme", default="classic", choices=sorted(st.THEMES))
     p.add_argument("--style", default="words", choices=["words", "karaoke", "segments"])
     p.add_argument("--font", default="Arial")
+    p.add_argument("--font-size", type=int, default=52,
+                   help="caption size in 720p units (scales ~2.67x on the 1920-tall output)")
+    p.add_argument("--margin-v", type=int, default=150,
+                   help="caption distance from the bottom edge, in 720p units")
     p.add_argument("--focus", default=None,
                    help="steer selection toward an angle/audience, e.g. "
                         "\"controversial takes for crypto skeptics\"")
@@ -413,7 +417,8 @@ def main():
     if not os.path.isfile(args.input):
         p.error(f"file not found: {args.input}")
 
-    opts = default_opts(theme=args.theme, style=args.style, font=args.font)
+    opts = default_opts(theme=args.theme, style=args.style, font=args.font,
+                        font_size=args.font_size, margin_v=args.margin_v)
 
     # 1. Transcribe once (cached).
     raw = transcribe_cached(args.input, opts, use_cache=not args.no_cache)
