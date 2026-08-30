@@ -226,8 +226,37 @@ def _scene_cuts(ffmpeg, video, start, dur, threshold=0.4):
     return sorted(float(m) for m in re.findall(r"pts_time:([\d.]+)", out.stderr))
 
 
+def _densify_traj(traj, half, max_x, dt=1 / 24.0):
+    """Turn sparse (per-detection) trajectory nodes into dense, per-~frame crop-x
+    commands via linear interpolation, so the pan is smooth instead of stepping.
+    Nodes flagged `snap` (scene cut / speaker switch) stay hard cuts."""
+    def clampx(center):
+        return int(round(min(max(center - half, 0), max_x)))
+
+    out, last_t = [], -1.0
+    for i, (t, s, snap) in enumerate(traj):
+        pts = []
+        if i == 0:
+            pts.append((t, s))
+        else:
+            tp, sp, _ = traj[i - 1]
+            if snap:
+                pts.append((max(tp, t - 1e-3), sp))          # hold old value to the cut
+                pts.append((t, s))                            # then jump
+            else:
+                n = max(1, int(round((t - tp) / dt)))         # interpolate the gap
+                for k in range(1, n + 1):
+                    frac = k / n
+                    pts.append((tp + (t - tp) * frac, sp + (s - sp) * frac))
+        for tt, ss in pts:
+            if tt > last_t + 1e-4:
+                out.append((tt, clampx(ss)))
+                last_t = tt
+    return out
+
+
 def build_track(ffmpeg, video, start, dur, w, h, model_path,
-                sample_fps=8, alpha=0.25, deadzone_frac=0.03, out_ar=9 / 16,
+                sample_fps=8, alpha=0.25, deadzone_frac=0.02, out_ar=9 / 16,
                 multi_speaker=False):
     """Plan a moving crop. Returns dict(crop_w, crop_h, commands=[(t, x_left)])
     or None if no face is ever found (caller should fall back to a center crop).
@@ -256,9 +285,9 @@ def build_track(ffmpeg, video, start, dur, w, h, model_path,
             last = cx
         filled.append((t, cx, sw))
 
-    # Smooth into a crop-x trajectory; snap (reset) at scene cuts AND speaker
-    # switches (a switch should be a hard cut to the new face, not a pan).
-    commands, s, cut_ptr, prev_t, n_switch = [], None, 0, None, 0
+    # Build a smoothed trajectory of crop centers; snap (reset) at scene cuts AND
+    # speaker switches (a switch should be a hard cut to the new face, not a pan).
+    traj, s, cut_ptr, prev_t, n_switch = [], None, 0, None, 0
     for t, cx, sw in filled:
         reset = s is None
         while cut_ptr < len(cuts) and cuts[cut_ptr] <= t:
@@ -272,9 +301,11 @@ def build_track(ffmpeg, video, start, dur, w, h, model_path,
             s = cx
         elif abs(cx - s) > deadzone:
             s += alpha * (cx - s)
-        x_left = int(round(min(max(s - half, 0), max_x)))
-        commands.append((t, x_left))
+        traj.append((t, s, reset and prev_t is not None))   # snap only mid-clip
         prev_t = t
+
+    # Densify to ~24 fps with interpolation so the pan glides instead of stepping.
+    commands = _densify_traj(traj, half, max_x)
 
     n_face = sum(1 for _, _, k, _ in samples if k == "face")
     n_sal = sum(1 for _, _, k, _ in samples if k == "sal")
